@@ -5,7 +5,7 @@ class PcmPlayerProcessor extends AudioWorkletProcessor {
     this.ready=false;this.sourcePos=0;this.sourceRate=sampleRate;
     this.ended=false;this.endNotified=false;this.paused=false;this.loopEnabled=false;this.hasLoop=false;
     this.loopStartFrame=0;this.loopEndFrame=0;this.timelineStartSeconds=0;this.reportCounter=0;
-    this.muted=Array(this.streams).fill(false);this.streamGain=Array(this.streams).fill(1);
+    this.muted=Array(this.streams).fill(false);this.gain=Array(this.streams).fill(1);
     this.port.onmessage=e=>{
       const m=e.data||{};
       if(m.type==='init'){
@@ -22,7 +22,7 @@ class PcmPlayerProcessor extends AudioWorkletProcessor {
       else if(m.type==='pause'){this.paused=true;}
       else if(m.type==='resume'){this.paused=false;}
       else if(m.type==='setLoop'){this.loopEnabled=!!m.enabled;this.endNotified=false;}
-      else if(m.type==='mute'){const i=Number(m.stream);if(i>=0&&i<this.streams)this.muted[i]=!!m.muted;}
+      else if(m.type==='mute'){const i=Number(m.stream);if(i>=0&&i<this.streams)this.muted[i]=!!m.muted;}else if(m.type==='gain'){const i=Number(m.stream);if(i>=0&&i<this.streams)this.gain[i]=Math.max(0,Math.min(2,Number(m.gain)||0));}
       else if(m.type==='stop'){this.reset();}
     };
   }
@@ -67,8 +67,8 @@ class PcmPlayerProcessor extends AudioWorkletProcessor {
       for(let st=0;st<this.streams;st++){
         if(this.muted[st])continue;
         const a=this.frameAt(st,base),b=this.frameAt(st,next);if(!a||!b)continue;
-        l+=((a[0]+(b[0]-a[0])*frac)/32768)*this.streamGain[st];
-        r+=((a[1]+(b[1]-a[1])*frac)/32768)*this.streamGain[st];
+        l+=((a[0]+(b[0]-a[0])*frac)/32768)*this.gain[st];
+        r+=((a[1]+(b[1]-a[1])*frac)/32768)*this.gain[st];
       }
       left[i]=Math.max(-1,Math.min(1,l));right[i]=Math.max(-1,Math.min(1,r));
       this.sourcePos+=ratio;
