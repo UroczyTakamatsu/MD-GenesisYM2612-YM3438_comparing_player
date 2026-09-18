@@ -204,6 +204,66 @@ fn render_ym2612_frames(chip: &mut Ym2612Stream, channels: usize, n: usize, skip
     Ok(())
 }
 
+
+fn make_chip(clock: u32, stream: usize) -> Result<StreamChip, String> {
+    let mut chip = ffi::create_chip(ffi::ChipType::Ym3438, clock);
+    chip.pin_mut().reset();
+    // Keep the existing YM3438 per-channel routing exactly as before.
+    for ch in 0..6u32 {
+        let reg = 0xb4 + ch;
+        let value = if stream < 6 && ch as usize == stream { 0xc0 }
+                    else if stream == 6 && ch == 5 { 0xc0 }
+                    else { 0x00 };
+        let port = if ch >= 3 { 2 } else { 0 };
+        chip.pin_mut().write(port, (reg - if ch >= 3 { 3 } else { 0 }) as u8);
+        chip.pin_mut().write(port + 1, value);
+    }
+    chip.pin_mut().write(0, 0x2b);
+    chip.pin_mut().write(1, if stream == 6 { 0x01 } else { 0x00 });
+    Ok(StreamChip { chip, out: Vec::new() })
+}
+
+fn apply_ym_write(sc: &mut StreamChip, stream: usize, cmd: u8, reg: u8, val: u8) {
+    let port = if cmd == 0x52 { 0 } else { 2 };
+    sc.chip.pin_mut().write(port, reg);
+    let mut value = val;
+    if (0xb4..=0xb6).contains(&reg) {
+        let ch = if cmd == 0x52 { (reg - 0xb4) as usize } else { (reg - 0xb4 + 3) as usize };
+        let selected = if stream < 6 { ch == stream } else { ch == 5 };
+        value = if selected { val } else { val & 0x3f };
+        if selected && (value & 0xc0) == 0 { value |= 0xc0; }
+    }
+    if cmd == 0x52 && reg == 0x2b {
+        value = if stream == 6 { val | 1 } else { val & !1 };
+    }
+    sc.chip.pin_mut().write(port + 1, value);
+}
+
+fn render_wait(
+    streams: &mut [StreamChip],
+    channels: usize,
+    native_rate: u32,
+    wait: u64,
+    timing: &mut TimingAccumulator,
+    skip_frames: &mut u64,
+    peak: &mut i32,
+) -> (u64, usize) {
+    if wait == 0 { return (0, 0); }
+    let n = timing.frames_for_wait(wait, native_rate);
+    if n == 0 { return (0, 0); }
+    let skip = (*skip_frames).min(n as u64) as usize;
+    for sc in streams.iter_mut() {
+        let mut buf = vec![0i32; n * channels];
+        sc.chip.pin_mut().generate(&mut buf);
+        for &x in &buf { *peak = (*peak).max(x.abs()); }
+        for &x in &buf[skip * channels..] {
+            sc.out.push(((x >> 8) * OUTPUT_GAIN).clamp(i16::MIN as i32, i16::MAX as i32) as i16);
+        }
+    }
+    *skip_frames -= skip as u64;
+    (n as u64, skip)
+}
+
 fn main() { if let Err(e) = run() { eprintln!("ERROR: {e}"); std::process::exit(2); } }
 
 fn run() -> Result<(), String> {
