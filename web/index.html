@@ -69,7 +69,10 @@ function newNode(){
   };
 }
 
-async function sendPcm(out,startSeconds,initialSeconds=startSeconds){
+async function sendPcm(rendered,startSeconds,initialSeconds=startSeconds){
+  const out3438=rendered.main?.chip==='3438'?rendered.main.out:null;
+  const out2612=rendered.ym2612?.chip==='2612'?rendered.ym2612.out:null;
+  const psgOut=out3438||out2612;
   const relativeLoopStart=hasLoop&&loopStartSeconds!==null?Math.max(0,(loopStartSeconds-startSeconds)*sourceRate):0;
   const relativeLoopEnd=hasLoop&&loopEndSeconds!==null?Math.max(0,(loopEndSeconds-startSeconds)*sourceRate):0;
   const initialOffsetFrames=Math.max(0,(initialSeconds-startSeconds)*sourceRate);
@@ -77,6 +80,8 @@ async function sendPcm(out,startSeconds,initialSeconds=startSeconds){
   node.port.postMessage({type:'init',sampleRate:sourceRate,startSeconds,initialOffsetFrames,loopEnabled,hasLoop,loopStartFrame:relativeLoopStart,loopEndFrame:relativeLoopEnd});
   for(let stream=0;stream<11;stream++){
     const name=stream===10?'/ym2612.pcm':stream<6?`/ym3438_fm${stream+1}.pcm`:stream===6?'/ym3438_dac.pcm':`/psg${stream-7}.pcm`;
+    const out=stream===10?out2612:(stream<=6?out3438:psgOut);
+    if(!out){log('[PCM-SKIP] '+name+' は今回のWASM実行では生成していません');continue;}
     const pcmBytes=await out.readFile(name);
     const CHUNK_BYTES=64*1024;
     for(let off=0;off<pcmBytes.byteLength;off+=CHUNK_BYTES){const chunk=pcmBytes.slice(off,Math.min(off+CHUNK_BYTES,pcmBytes.byteLength));node.port.postMessage({type:'chunk',stream,buffer:chunk.buffer},[chunk.buffer]);}
@@ -86,7 +91,6 @@ async function sendPcm(out,startSeconds,initialSeconds=startSeconds){
   log('[LOOP-SEND] 全PCM転送完了 → Workletへend送信');
   return true;
 }
-
 function buildChannelButtons(){
   channelButtons.textContent='';
   streamNames.forEach((name,i)=>{const stream=channelStreams[i];const b=document.createElement('button');b.textContent=name+': '+(streamMuted[stream]?'OFF':'ON');b.disabled=!running;b.onclick=()=>{streamMuted[stream]=!streamMuted[stream];b.textContent=name+': '+(streamMuted[stream]?'OFF':'ON');if(node)node.port.postMessage({type:'mute',stream,muted:streamMuted[stream]});log('[CH] '+name+' '+(streamMuted[stream]?'OFF':'ON'));};channelButtons.appendChild(b);});
@@ -112,15 +116,30 @@ async function ensureEngine(){
   if(!wasmModule){const r=await fetch('./ym3438_browser_test.wasm',{cache:'no-store'});if(!r.ok)throw new Error('WASM HTTP '+r.status);const bytes=new Uint8Array(await r.arrayBuffer());log('OK: WASM '+bytes.byteLength+' bytes');wasmModule=await WebAssembly.compile(bytes);log('OK: WASMコンパイル');}
 }
 
-async function renderFromPosition(seconds){
-  const input=new Directory(),out=new Directory();
-  const inputBytes=new Uint8Array(await selectedFile.arrayBuffer());await input.writeFile('/input.vgm',inputBytes);
+async function renderFromPosition(seconds, mode=compareMode){
+  const input=new Directory();
+  const inputBytes=new Uint8Array(await selectedFile.arrayBuffer());
+  await input.writeFile('/input.vgm',inputBytes);
   const seekMs=Math.max(0,Math.round(seconds*1000));
-  log('[5] VGMを先頭から再構築: '+(seekMs/1000).toFixed(2)+'s');
-  const instance=await runWasix(wasmModule,{args:[`--seek-ms=${seekMs}`],mount:{'/in':input,'/out':out}});
-  const result=await instance.wait();result.out=out;return result;
+  log('[5] VGMを先頭から再構築: '+(seekMs/1000).toFixed(2)+'s / mode='+mode);
+  async function runOne(chip){
+    const out=new Directory();
+    const instance=await runWasix(wasmModule,{args:[`--seek-ms=${seekMs}`,`--chip=${chip}`],mount:{'/in':input,'/out':out}});
+    const result=await instance.wait();result.out=out;result.chip=chip;return result;
+  }
+  if(mode==='both'){
+    log('[5A] YM3438を単独WASM実行');
+    const a=await runOne('3438');
+    if(a.code!==0)throw new Error('YM3438 render exit code '+a.code);
+    log('[5B] YM2612を別WASM実行（oneshot負荷分離）');
+    const b=await runOne('2612');
+    if(b.code!==0)throw new Error('YM2612 render exit code '+b.code);
+    return {main:a,ym2612:b};
+  }
+  log('[5A] '+chip+'を単独WASM実行');
+  const r=await runOne(mode);
+  return {main:r,ym2612:mode==='2612'?r:null};
 }
-
 function parseMetadata(stdout,preserveLoopState=false){
   const rate=stdout.match(/pcm_sample_rate=(\d+)/),ch=stdout.match(/pcm_channels=(\d+)/);
   const dur=stdout.match(/timeline_duration_seconds=([0-9.]+)/)||stdout.match(/duration_seconds=([0-9.]+)/);
@@ -143,10 +162,10 @@ async function main(){
   const serial=++renderSerial;
   try{
     logEl.textContent='';log('[1] 再生エンジン準備');await ensureEngine();
-    log('[2] VGM/VGZ → YM3438 → PCM');const result=await renderFromPosition(0);
-    if(serial!==renderSerial)return;if(result.code!==0)throw new Error('YM3438 VGM/VGZ test exit code '+result.code);
+    log('[2] VGM/VGZ → 選択モードのPCM生成');const rendered=await renderFromPosition(0,compareMode);
+    if(serial!==renderSerial)return;const result=rendered.main;if(result.code!==0)throw new Error('VGM/VGZ render exit code '+result.code);
     const stdout=result.stdout??result.stdoutUtf8??'';log('exit code: '+result.code);log(stdout);parseMetadata(stdout);
-    newNode();log('[6] 11系統PCMをAudioWorkletへ転送（YM2612はストリーミング生成）');await sendPcm(result.out,0);applyMix();log('PCM streams: YM2612 + FM1-FM6 + DAC(hidden) + PSG1-PSG3 / source rate: '+sourceRate+' Hz');
+    newNode();log('[6] 11系統PCMをAudioWorkletへ転送（YM2612は別WASM実行）');await sendPcm(rendered,0);applyMix();log('PCM streams: YM2612 + FM1-FM6 + DAC(hidden) + PSG1-PSG3 / source rate: '+sourceRate+' Hz');
     await audioContext.resume();pauseBtn.disabled=false;seekEl.disabled=loopEnabled;updateTime(0);updateChannelUI();log('[7] PCM再生開始');
   }catch(e){log('\nERROR: '+(e?.stack||e));stop();}
 }
@@ -163,9 +182,9 @@ async function doSeek(seconds){
   log('\n[S1] シーク要求: '+target.toFixed(2)+'s');
   try{
     if(node){node.port.postMessage({type:'stop'});node.disconnect();node=null;}log('[S2] 現在のPCMを停止');
-    const result=await renderFromPosition(target);if(serial!==renderSerial)return;
-    const stdout=result.stdout??result.stdoutUtf8??'';log('exit code: '+result.code);log(stdout);if(result.code!==0)throw new Error('シーク用YM3438実行失敗: exit code '+result.code);
-    parseMetadata(stdout,true);newNode();await sendPcm(result.out,target,target);applyMix();log('[S4] シーク後11系統PCM転送完了');updateChannelUI();updateTime(target);
+    const rendered=await renderFromPosition(target,compareMode);if(serial!==renderSerial)return;const result=rendered.main;
+    const stdout=result.stdout??result.stdoutUtf8??'';log('exit code: '+result.code);log(stdout);if(result.code!==0)throw new Error('シーク用WASM実行失敗: exit code '+result.code);
+    parseMetadata(stdout,true);newNode();await sendPcm(rendered,target,target);applyMix();log('[S4] シーク後11系統PCM転送完了');updateChannelUI();updateTime(target);
     if(resume){await audioContext.resume();log('[S5] シーク後の再生を開始');}else{node.port.postMessage({type:'pause'});log('[S5] シーク完了（停止中）');}
   }catch(e){log('\n[S-ERROR] '+(e?.stack||e));}
   finally{seeking=false;playBtn.disabled=true;stopBtn.disabled=false;pauseBtn.disabled=false;updateLoopUI();}
@@ -218,7 +237,7 @@ function stop(){++renderSerial;if(node){node.port.postMessage({type:'stop'});nod
 
 let compareMode='3438',gain2612=1,gain3438=1;
 function applyMix(){if(!node)return;for(let i=0;i<11;i++){let g=1;if(i===10)g=(compareMode==='3438'?0:gain2612);else if(i<=6)g=(compareMode==='2612'?0:gain3438);node.port.postMessage({type:'gain',stream:i,gain:g});}}
-function setCompareMode(m){compareMode=m;document.querySelectorAll('#mode button').forEach(b=>b.classList.remove('active'));document.querySelector(m==='2612'?'#m2612':m==='3438'?'#m3438':'#mboth').classList.add('active');log('[MODE] '+m);applyMix();}
+async function setCompareMode(m){if(m===compareMode&&node){applyMix();return;}const old=compareMode;compareMode=m;document.querySelectorAll('#mode button').forEach(b=>b.classList.remove('active'));document.querySelector(m==='2612'?'#m2612':m==='3438'?'#m3438':'#mboth').classList.add('active');log('[MODE] '+old+' → '+m);if(!running||!selectedFile||!wasmModule||!audioContext||seeking){applyMix();return;}const target=currentSeconds;const serial=++renderSerial;seeking=true;pauseBtn.disabled=true;stopBtn.disabled=true;log('[MODE] 現在位置 '+target.toFixed(3)+'s から再構築');try{if(node){node.port.postMessage({type:'stop'});node.disconnect();node=null;}const rendered=await renderFromPosition(target,m);if(serial!==renderSerial)return;const result=rendered.main;if(result.code!==0)throw new Error('モード切替WASM exit code '+result.code);const stdout=result.stdout??result.stdoutUtf8??'';log('exit code: '+result.code);log(stdout);parseMetadata(stdout,true);newNode();await sendPcm(rendered,target,target);applyMix();await audioContext.resume();updateChannelUI();log('[MODE] 切替完了');}catch(e){log('[MODE-ERROR] '+(e?.stack||e));compareMode=old;document.querySelector(old==='2612'?'#m2612':old==='3438'?'#m3438':'#mboth').classList.add('active');}finally{seeking=false;pauseBtn.disabled=false;stopBtn.disabled=false;updateLoopUI();} }
 document.querySelector('#m2612').onclick=()=>setCompareMode('2612');document.querySelector('#m3438').onclick=()=>setCompareMode('3438');document.querySelector('#mboth').onclick=()=>setCompareMode('both');
 document.querySelector('#v2612').oninput=e=>{gain2612=+e.target.value;document.querySelector('#v2612n').textContent=Math.round(gain2612*100)+'%';applyMix();};
 document.querySelector('#v3438').oninput=e=>{gain3438=+e.target.value;document.querySelector('#v3438n').textContent=Math.round(gain3438*100)+'%';applyMix();};
