@@ -267,7 +267,14 @@ fn render_wait(
 fn main() { if let Err(e) = run() { eprintln!("ERROR: {e}"); std::process::exit(2); } }
 
 fn run() -> Result<(), String> {
-    let seek_ms: u64 = env::args().skip(1).find_map(|a| a.strip_prefix("--seek-ms=").and_then(|v| v.parse().ok())).unwrap_or(0);
+    let args: Vec<String> = env::args().skip(1).collect();
+    let seek_ms: u64 = args.iter().find_map(|a| a.strip_prefix("--seek-ms=").and_then(|v| v.parse().ok())).unwrap_or(0);
+    let chip_mode = args.iter().find_map(|a| a.strip_prefix("--chip=")).unwrap_or("both");
+    let render_3438 = chip_mode == "3438" || chip_mode == "both";
+    let render_2612 = chip_mode == "2612" || chip_mode == "both";
+    println!("chip_mode={chip_mode}");
+    println!("render_ym3438={render_3438}");
+    println!("render_ym2612={render_2612}");
     println!("YM3438 browser VGM/VGZ -> per-channel PCM diagnostic test");
     println!("seek_ms={seek_ms}");
     println!("channel_streams=YM2612,FM1,FM2,FM3,FM4,FM5,FM6,DAC,PSG1,PSG2,PSG3");
@@ -290,8 +297,9 @@ fn run() -> Result<(), String> {
     println!("ym2612_output_gain=1 (no YM3438 128x gain)");
     let loop_rel=u32le(&bytes,0x1c); let loop_pos=if loop_rel==0{None}else{Some(0x1c+loop_rel as usize)}; let loop_samples_header=u32le(&bytes,0x20);
     println!("vgm_loop_position={loop_pos:?}"); println!("vgm_loop_samples={loop_samples_header}");
-    let mut streams=Vec::with_capacity(FM_STREAMS); for s in 0..FM_STREAMS { streams.push(make_chip(clock,s)?); }
-    let mut ym2612=make_ym2612(clock)?;
+    let mut streams=Vec::with_capacity(FM_STREAMS);
+    if render_3438 { for s in 0..FM_STREAMS { streams.push(make_chip(clock,s)?); } }
+    let mut ym2612=if render_2612 { Some(make_ym2612(clock)?) } else { None };
     let mut psg=PsgChip::new(psg_clock,rate);
     let mut blocks:HashMap<u8,Vec<u8>>=HashMap::new(); let mut pos=data_off; let mut timeline_samples=0u64; let mut loop_start_samples=None; let mut loop_end_samples=None;
     let mut timing=TimingAccumulator::new(); let mut dac_pos=0usize; let mut waits=0u64; let mut writes=0u64; let mut dac_writes=0u64; let mut ym_writes=0u64; let mut data_blocks=0u64; let mut commands=0u64; let mut peak=0i32; let mut ended=false;
@@ -301,13 +309,13 @@ fn run() -> Result<(), String> {
         if Some(pos)==loop_pos && loop_start_samples.is_none(){loop_start_samples=Some(timeline_samples);}
         match cmd {
             0x50=>{ if pos+2>eof{return Err("truncated PSG write".into());} psg.write(bytes[pos+1]); pos+=2; },
-            0x52|0x53=>{if pos+3>eof{return Err("truncated YM write".into());} let reg=bytes[pos+1];let val=bytes[pos+2]; for (s,sc) in streams.iter_mut().enumerate(){apply_ym_write(sc,s,cmd,reg,val);} apply_ym2612_write(&mut ym2612,cmd,reg,val); writes+=1;ym_writes+=1;pos+=3;}
-            0x61=>{let n=u16::from_le_bytes([bytes[pos+1],bytes[pos+2]]) as u64;let (generated_frames,skip)=render_wait(&mut streams,channels,rate,n,&mut timing,&mut skip_frames,&mut peak);render_ym2612_frames(&mut ym2612,channels,generated_frames as usize,skip)?; psg.generate(generated_frames as usize,skip,PSG_OUTPUT_GAIN);waits+=n;timeline_samples+=n;pos+=3;}
-            0x62=>{let (generated_frames,skip)=render_wait(&mut streams,channels,rate,735,&mut timing,&mut skip_frames,&mut peak);render_ym2612_frames(&mut ym2612,channels,generated_frames as usize,skip)?;psg.generate(generated_frames as usize,skip,PSG_OUTPUT_GAIN);waits+=735;timeline_samples+=735;pos+=1;}
-            0x63=>{let (generated_frames,skip)=render_wait(&mut streams,channels,rate,882,&mut timing,&mut skip_frames,&mut peak);render_ym2612_frames(&mut ym2612,channels,generated_frames as usize,skip)?;psg.generate(generated_frames as usize,skip,PSG_OUTPUT_GAIN);waits+=882;timeline_samples+=882;pos+=1;}
+            0x52|0x53=>{if pos+3>eof{return Err("truncated YM write".into());} let reg=bytes[pos+1];let val=bytes[pos+2]; if render_3438 { for (s,sc) in streams.iter_mut().enumerate(){apply_ym_write(sc,s,cmd,reg,val);} } if let Some(chip)=ym2612.as_mut(){ apply_ym2612_write(chip,cmd,reg,val); } writes+=1;ym_writes+=1;pos+=3;}
+            0x61=>{let n=u16::from_le_bytes([bytes[pos+1],bytes[pos+2]]) as u64;let (generated_frames,skip)=render_wait(&mut streams,channels,rate,n,&mut timing,&mut skip_frames,&mut peak);if let Some(chip)=ym2612.as_mut(){ render_ym2612_frames(chip,channels,generated_frames as usize,skip)?; } psg.generate(generated_frames as usize,skip,PSG_OUTPUT_GAIN);waits+=n;timeline_samples+=n;pos+=3;}
+            0x62=>{let (generated_frames,skip)=render_wait(&mut streams,channels,rate,735,&mut timing,&mut skip_frames,&mut peak);if let Some(chip)=ym2612.as_mut(){ render_ym2612_frames(chip,channels,generated_frames as usize,skip)?; }psg.generate(generated_frames as usize,skip,PSG_OUTPUT_GAIN);waits+=735;timeline_samples+=735;pos+=1;}
+            0x63=>{let (generated_frames,skip)=render_wait(&mut streams,channels,rate,882,&mut timing,&mut skip_frames,&mut peak);if let Some(chip)=ym2612.as_mut(){ render_ym2612_frames(chip,channels,generated_frames as usize,skip)?; }psg.generate(generated_frames as usize,skip,PSG_OUTPUT_GAIN);waits+=882;timeline_samples+=882;pos+=1;}
             0x67=>{let len=command_size(&bytes,pos,eof).ok_or("invalid 0x67 data block")?;let ty=bytes[pos+2];let n=u32le(&bytes,pos+3) as usize;let st=pos+7;if st+n>eof{return Err("truncated 0x67 data block".into());}blocks.insert(ty,bytes[st..st+n].to_vec());data_blocks+=1;if ty==0{dac_pos=0;}pos+=len;}
-            0x70..=0x7f=>{let n=(cmd&0x0f) as u64+1;let (generated_frames,skip)=render_wait(&mut streams,channels,rate,n,&mut timing,&mut skip_frames,&mut peak);render_ym2612_frames(&mut ym2612,channels,generated_frames as usize,skip)?; psg.generate(generated_frames as usize,skip,PSG_OUTPUT_GAIN);waits+=n;timeline_samples+=n;pos+=1;}
-            0x80..=0x8f=>{let bank=blocks.get(&0).ok_or("DAC bank missing")?;if dac_pos>=bank.len(){return Err("DAC bank exhausted".into());}let v=bank[dac_pos];dac_pos+=1;for (s,sc) in streams.iter_mut().enumerate(){apply_ym_write(sc,s,0x52,0x2a,v);}apply_ym2612_write(&mut ym2612,0x52,0x2a,v);writes+=1;dac_writes+=1;let n=(cmd&0x0f) as u64;let (generated_frames,skip)=render_wait(&mut streams,channels,rate,n,&mut timing,&mut skip_frames,&mut peak);render_ym2612_frames(&mut ym2612,channels,generated_frames as usize,skip)?; psg.generate(generated_frames as usize,skip,PSG_OUTPUT_GAIN);waits+=n;timeline_samples+=n;pos+=1;}
+            0x70..=0x7f=>{let n=(cmd&0x0f) as u64+1;let (generated_frames,skip)=render_wait(&mut streams,channels,rate,n,&mut timing,&mut skip_frames,&mut peak);if let Some(chip)=ym2612.as_mut(){ render_ym2612_frames(chip,channels,generated_frames as usize,skip)?; } psg.generate(generated_frames as usize,skip,PSG_OUTPUT_GAIN);waits+=n;timeline_samples+=n;pos+=1;}
+            0x80..=0x8f=>{let bank=blocks.get(&0).ok_or("DAC bank missing")?;if dac_pos>=bank.len(){return Err("DAC bank exhausted".into());}let v=bank[dac_pos];dac_pos+=1;if render_3438 { for (s,sc) in streams.iter_mut().enumerate(){apply_ym_write(sc,s,0x52,0x2a,v);} } if let Some(chip)=ym2612.as_mut(){ apply_ym2612_write(chip,0x52,0x2a,v); }writes+=1;dac_writes+=1;let n=(cmd&0x0f) as u64;let (generated_frames,skip)=render_wait(&mut streams,channels,rate,n,&mut timing,&mut skip_frames,&mut peak);if let Some(chip)=ym2612.as_mut(){ render_ym2612_frames(chip,channels,generated_frames as usize,skip)?; } psg.generate(generated_frames as usize,skip,PSG_OUTPUT_GAIN);waits+=n;timeline_samples+=n;pos+=1;}
             0xe0=>{let off=u32le(&bytes,pos+1) as usize;let bank=blocks.get(&0).ok_or("DAC bank missing")?;if off>=bank.len(){return Err("DAC seek out of range".into());}dac_pos=off;pos+=5;}
             0x66=>{if loop_start_samples.is_some(){loop_end_samples=Some(timeline_samples);}ended=true;}
             _=>{let len=command_size(&bytes,pos,eof).ok_or_else(||format!("unsupported command 0x{cmd:02X} at 0x{pos:X}"))?;pos+=len;}
@@ -319,8 +327,10 @@ fn run() -> Result<(), String> {
     println!("loop_start_seconds={}",loop_start_seconds.map(|v|format!("{v:.6}")).unwrap_or("none".into()));println!("loop_end_seconds={}",loop_end_seconds.map(|v|format!("{v:.6}")).unwrap_or("none".into()));println!("loop_prepared={}",loop_start_seconds.is_some()&&loop_end_seconds.is_some());
     println!("generated_frames={frames}");println!("skipped_native_frames={}",target_frames.saturating_sub(skip_frames));println!("seek_effective_seconds={:.6}",target_frames as f64/rate as f64);println!("peak_raw={peak}");println!("output_gain={OUTPUT_GAIN}");println!("timing_remainder_1_44100={}",timing.remainder);
     if frames==0||peak==0{return Err("VGM parsing completed but PCM is silent".into());}
-    ym2612.writer.flush().map_err(|e| format!("failed to flush YM2612 PCM: {e}"))?;
-    println!("ym2612_path=/out/ym2612.pcm");println!("ym2612_bytes={}",ym2612.frames * channels as u64 * 2);
+    if let Some(chip)=ym2612.as_mut() {
+        chip.writer.flush().map_err(|e| format!("failed to flush YM2612 PCM: {e}"))?;
+        println!("ym2612_path=/out/ym2612.pcm");println!("ym2612_bytes={}",chip.frames * channels as u64 * 2);
+    }
     let out_dir="/out"; for (s,sc) in streams.iter().enumerate(){let name=if s<6{format!("ym3438_fm{}.pcm",s+1)}else{"ym3438_dac.pcm".into()};let path=format!("{out_dir}/{name}");let mut pcm=Vec::with_capacity(sc.out.len()*2);for v in &sc.out{pcm.extend_from_slice(&v.to_le_bytes());}fs::write(&path,&pcm).map_err(|e|format!("failed to write {path}: {e}"))?;println!("stream{}_path={path}",s+1);println!("stream{}_bytes={}",s+1,pcm.len());} for ch in 0..3 { let path=format!("{out_dir}/psg{}.pcm",ch+1); let mut pcm=Vec::with_capacity(psg.out[ch].len()*2); for v in &psg.out[ch]{pcm.extend_from_slice(&v.to_le_bytes());} fs::write(&path,&pcm).map_err(|e|format!("failed to write {path}: {e}"))?; println!("psg{}_path={path}",ch+1); println!("psg{}_bytes={}",ch+1,pcm.len());}
     println!("pcm_channels={channels}");println!("pcm_sample_rate={rate}");println!("pcm_streams={STREAMS}");println!("psg_streams=3");Ok(())
 }
