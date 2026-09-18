@@ -1,4 +1,4 @@
-name: Build and deploy YM3438 browser player
+name: Build and deploy YM2612 vs YM3438 comparison player
 
 on:
   workflow_dispatch:
@@ -58,12 +58,12 @@ jobs:
           cargo build --release --target wasm32-wasip1
           find target/wasm32-wasip1/release -maxdepth 1 -type f -name '*.wasm' -ls
 
-      - name: Copy browser WASM
+      - name: Copy comparison WASM
         run: |
           cp target/wasm32-wasip1/release/ym3438-browser-test.wasm web/ym3438_browser_test.wasm
           ls -lh web/ym3438_browser_test.wasm web/worklet.js
 
-      - name: Package site
+      - name: Package comparison site
         run: |
           rm -rf dist
           mkdir dist
@@ -74,7 +74,7 @@ jobs:
           cd dist
           zip -r ../ym3438-browser-test.zip .
 
-      - name: Upload browser test artifact
+      - name: Upload comparison artifact
         uses: actions/upload-artifact@v4
         with:
           name: ym3438-browser-test
